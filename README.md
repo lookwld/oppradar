@@ -184,7 +184,7 @@ Windows 用户也可以直接双击 `start.bat`。
 ## 目录结构
 
 ```
-opp-radar/
+oppradar/
 ├── index.html                 # 全部界面与逻辑（单文件，无构建步骤）
 ├── start.py                   # 本地预览服务器（只绑定 127.0.0.1，随机端口）
 ├── start.bat                  # Windows 双击启动
