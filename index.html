@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>交易机会 · 异动雷达 / 盯合约 / MA99 回踩</title>
-<!-- 安全策略：只允许连这两家交易所的公开行情接口，任何其他域名一律拦下；
+<!-- 安全策略：只允许连币安 U 本位永续的公开行情接口，任何其他域名一律拦下；
      不外发 Referer；不加载任何外部脚本 / 图片 / 字体。 -->
-<meta http-equiv="Content-Security-Policy" content="connect-src https://api.gateio.ws https://fapi.binance.com; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="connect-src https://fapi.binance.com; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex,nofollow">
 <style>
@@ -133,7 +133,7 @@
   <!-- 盯合约 -->
   <section id="viewWatch" style="display:none">
     <div class="addbox">
-      <input id="addInput" list="symList" placeholder="输入合约名，如 BTC_USDT / ETH">
+      <input id="addInput" list="symList" placeholder="输入合约名，如 BTCUSDT / ETH">
       <datalist id="symList"></datalist>
       <button id="btnAdd">盯住</button>
     </div>
@@ -166,8 +166,10 @@
   </section>
 
   <div class="foot">
-    异动 / 盯合约：Gate 永续公开接口，每 5 秒刷新；MA99 回踩：币安 U 本位日线，扫一次缓存 12 小时 · 涨红跌绿<br>
-    短周期涨跌与持仓变化由本机滚动采样计算，首次打开需等待所选窗口累积
+    数据全部来自币安 U 本位永续公开接口（fapi.binance.com），每 5 秒刷新 · 涨红跌绿<br>
+    短周期涨跌由本机滚动采样计算，首次打开需等待所选窗口累积；
+    持仓量按成交额前 150 个合约轮转拉取（约 15 秒覆盖一遍）；
+    多空账户比只对自选合约查询，覆盖不到的显示「—」
   </div>
 </main>
 
@@ -177,21 +179,35 @@
 "use strict";
 
 /* ---------- 常量 ---------- */
-const API_TICK = "https://api.gateio.ws/api/v4/futures/usdt/tickers";
-const API_CON  = "https://api.gateio.ws/api/v4/futures/usdt/contracts";
-const POLL_MS  = 5000;
-const CAP      = 200;              // 环形缓冲格数（200 x 5s = 16.7 分钟）
-const TOPN     = 30;
+/* 全部走币安 U 本位永续（fapi）公开接口，没有任何密钥 */
+const BIN        = "https://fapi.binance.com";
+const API_TICK   = BIN + "/fapi/v1/ticker/24hr";      // 全市场 24h 行情（一次拿全）
+const API_PREM   = BIN + "/fapi/v1/premiumIndex";     // 资金费率 + 标记价（一次拿全）
+const API_INFO   = BIN + "/fapi/v1/exchangeInfo";     // 合约清单（过滤出 USDT 永续）
+const API_FUND   = BIN + "/fapi/v1/fundingInfo";      // 非 8 小时的结算周期（只有例外项）
+const API_OI     = BIN + "/fapi/v1/openInterest?symbol=";
+const API_RATIO  = BIN + "/futures/data/globalLongShortAccountRatio";
+const POLL_MS    = 5000;
+const CAP        = 200;              // 环形缓冲格数（200 x 5s = 16.7 分钟）
+const TOPN       = 30;
+const OI_POOLMAX = 150;              // 只对成交额前 150 个合约取持仓量
+const OI_BATCH   = 50;               // 每 5 秒取 50 个，约 15 秒轮完一遍
 
 /* ---------- 状态 ---------- */
 const S = {
-  tick: new Map(),        // 合约 -> {p, chg24, hi, lo, vq, size, mult, fund, mark, idx}
-  meta: new Map(),        // 合约 -> {interval, next, longU, shortU, delist, status, levMax}
+  tick: new Map(),        // 合约 -> {p, chg24, hi, lo, vq, size, fund, next, mark}
+  meta: new Map(),        // 合约 -> {interval, status, base}
+  valid: new Set(),       // 可交易的 USDT 永续合约名
+  ratio: new Map(),       // 合约 -> {ud, at}  多空账户比
+  oiPool: [], oiCur: 0,   // 持仓量轮转游标
   syms: [], idx: new Map(),
   ring: [], pos: 0, N: 0,
   lastTickAt: 0, ok: false,
   win: 180, board: "up", tab: "move", minQuote: 1e6,
-  pins: load("radar.pins", []),
+  pins: (load("radar.pins", []) || []).map(n => {
+    let s = String(n).toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return s.endsWith("USDT") ? s : s + "USDT";     // 老版本存的是 BTC_USDT，顺手迁移
+  }),
   sound: load("radar.sound", true),
   alertPct: load("radar.alertPct", 1.5),
   alertFund: load("radar.alertFund", 0.001),
@@ -227,6 +243,8 @@ const fmtU = v => {
   return v.toFixed(0);
 };
 const pct = (v, d=2) => (!isFinite(v) ? "—" : (v>0?"+":"") + (v*100).toFixed(d) + "%");
+/* 币安合约名是 BTCUSDT 这种连写，展示时把 USDT 后缀去掉 */
+const baseOf = n => String(n == null ? "" : n).replace(/USDT$/, "");
 const cls = v => (!isFinite(v) || Math.abs(v) < 1e-9) ? "flat" : (v > 0 ? "up" : "dn");
 const hhmmss = ts => {
   const d = new Date(ts);
@@ -292,33 +310,48 @@ async function fetchJSON(url){
 }
 async function loadMeta(){
   try{
-    const arr = await fetchJSON(API_CON);
-    for(const c of arr){
-      S.meta.set(c.name, {
-        interval: c.funding_interval || 28800,
-        next: c.funding_next_apply || 0,
-        longU: c.long_users || 0,
-        shortU: c.short_users || 0,
-        delist: !!c.in_delisting,
-        status: c.status || "",
-        levMax: parseFloat(c.leverage_max) || 0,
+    /* 合约清单 + 非默认结算周期（大多数是 8 小时，只有例外项才出现在 fundingInfo 里） */
+    const [info, fi] = await Promise.all([
+      fetchJSON(API_INFO),
+      fetchJSON(API_FUND).catch(() => []),
+    ]);
+    const fiMap = new Map();
+    for(const x of (fi || [])) fiMap.set(x.symbol, (x.fundingIntervalHours || 8) * 3600);
+    for(const c of (info.symbols || [])){
+      /* 只要 USDT 计价的永续、且正在交易；币安还有 USDC 计价和交割合约，全部挡掉 */
+      if(c.contractType !== "PERPETUAL" || c.status !== "TRADING" || c.quoteAsset !== "USDT") continue;
+      S.valid.add(c.symbol);
+      S.meta.set(c.symbol, {
+        interval: fiMap.get(c.symbol) || 28800,
+        next: 0,
+        status: c.status,
+        base: c.baseAsset || "",
+        delist: false,
       });
     }
+    /* 索引在这里一次性定死，避免运行中新合约陆续到达把环形缓冲撑爆重来 */
+    S.syms = [...S.valid].sort();
+    S.idx = new Map(S.syms.map((n, i) => [n, i]));
     fillDatalist();
-  }catch(e){ console.warn("contracts 拉取失败", e); }
+    return S.valid.size;
+  }catch(e){
+    console.warn("exchangeInfo 拉取失败", e);
+    return 0;
+  }
 }
 /* 自选合约预热：拉 1 分钟 K 线，免等窗口累积 */
 async function primePin(name){
   if(S.idx.get(name) === undefined) return;
   if(S.hist.has(name) && Date.now() - (S.histTs.get(name)||0) < 120000) return;
   try{
-    const url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract="
-              + encodeURIComponent(name) + "&interval=1m&limit=200";
+    const url = BIN + "/fapi/v1/klines?symbol=" + encodeURIComponent(name)
+              + "&interval=1m&limit=200";
     const arr = await fetchJSON(url);
     const pts = [];
     for(const k of arr){
-      const c = parseFloat(k.c);
-      if(c > 0) pts.push({ t:(parseInt(k.t,10) + 60)*1000, p:c });   // t = 开盘秒，转收盘毫秒
+      const c = parseFloat(k[4]);          // [4] = 收盘价
+      const t = parseInt(k[6], 10);        // [6] = 收盘时刻（毫秒）
+      if(c > 0) pts.push({ t, p:c });
     }
     pts.sort((a,b)=>a.t-b.t);
     if(pts.length){ S.hist.set(name, pts); S.histTs.set(name, Date.now()); }
@@ -338,32 +371,64 @@ function fmtDur(sec){
   return sec + " 秒";
 }
 
+/* 持仓量：币安没有「全市场一次拿全」的接口，只能按合约逐个查。
+   所以只对成交额前 150 个轮转，每轮 50 个（5 秒一轮，约 15 秒覆盖一遍）。 */
+async function pollOI(){
+  const pool = S.oiPool;
+  if(!pool.length) return;
+  const n = pool.length;
+  const take = Math.min(OI_BATCH, n);
+  const batch = [];
+  for(let k = 0; k < take; k++) batch.push(pool[(S.oiCur + k) % n]);
+  S.oiCur = (S.oiCur + take) % n;
+  await Promise.all(batch.map(async sym => {
+    try{
+      const d = await fetchJSON(API_OI + encodeURIComponent(sym));
+      const v = parseFloat(d.openInterest);
+      const r = S.tick.get(sym);
+      if(r && isFinite(v) && v >= 0) r.size = v;    // 单位是币，不是张
+    }catch(e){ /* 单个失败跳过，下一轮再来 */ }
+  }));
+}
+
 async function tick(){
   if(S.paused) return;
   try{
-    const arr = await fetchJSON(API_TICK);
+    /* 一次拿全市场行情 + 一次拿全市场资金费率，两个请求搞定 */
+    const [arrT, arrP] = await Promise.all([
+      fetchJSON(API_TICK),
+      fetchJSON(API_PREM).catch(() => []),
+    ]);
+    const prem = new Map();
+    for(const p of (arrP || [])) prem.set(p.symbol, p);
     const now = Date.now();
-    for(const t of arr){
-      const name = t.contract;
-      if(!name) continue;
+    for(const t of arrT){
+      const name = t.symbol;
+      if(!S.valid.has(name)) continue;          // 挡掉 USDC 计价 / 交割合约
       let i = S.idx.get(name);
       if(i === undefined){ i = S.syms.length; S.idx.set(name, i); S.syms.push(name); }
-      const last = parseFloat(t.last) || parseFloat(t.mark_price) || 0;
+      const last = parseFloat(t.lastPrice) || 0;
+      if(!(last > 0)) continue;
+      const p = prem.get(name) || {};
+      const prev = S.tick.get(name);
       S.tick.set(name, {
         p: last,
-        mark: parseFloat(t.mark_price) || last,
-        chg24: parseFloat(t.change_percentage) / 100 || 0,
-        hi: parseFloat(t.high_24h) || 0,
-        lo: parseFloat(t.low_24h) || 0,
-        vq: parseFloat(t.volume_24h_quote) || 0,
-        size: parseFloat(t.total_size) || 0,
-        mult: parseFloat(t.quanto_multiplier) || 1,
-        fund: parseFloat(t.funding_rate) || 0,
+        mark: parseFloat(p.markPrice) || last,
+        chg24: (parseFloat(t.priceChangePercent) || 0) / 100,
+        hi: parseFloat(t.highPrice) || 0,
+        lo: parseFloat(t.lowPrice) || 0,
+        vq: parseFloat(t.quoteVolume) || 0,
+        size: prev ? prev.size : 0,            // 持仓量由 pollOI 写入，这里只继承
+        fund: parseFloat(p.lastFundingRate) || 0,
+        next: parseInt(p.nextFundingTime, 10) || 0,   // 已经是毫秒
       });
     }
+    /* MA99 全市场扫描本身要发 500+ 个请求，那一刻先停掉持仓量轮转，避免撞权重上限 */
+    if(!M.scanning) await pollOI();            // 本轮批次写完再记账
     S.ok = true; S.lastTickAt = now;
     pushSnap(now);
     compute();
+    syncMa99Live();
     render();
     paintStatus();
   }catch(e){
@@ -373,8 +438,25 @@ async function tick(){
 function paintStatus(err){
   $("#dot").className = "dot" + (S.ok ? "" : " off");
   $("#meta").textContent = S.ok
-    ? `更新 ${hhmmss(S.lastTickAt)} · ${S.tick.size} 个合约`
+    ? `更新 ${hhmmss(S.lastTickAt)} · ${S.syms.length} 个合约`
     : ("连接失败，重试中…" + (err ? "（" + err + "）" : ""));
+}
+
+/* 多空账户比：币安只提供按合约查询，所以只查自选里的那几个，5 分钟内复用 */
+async function pollRatio(){
+  for(const sym of S.pins){
+    const c = S.ratio.get(sym);
+    if(c && Date.now() - c.at < 5*60000) continue;
+    try{
+      const arr = await fetchJSON(`${API_RATIO}?symbol=${encodeURIComponent(sym)}&period=5m&limit=1`);
+      const a = (arr && arr.length) ? arr[arr.length-1] : null;
+      const la = a ? parseFloat(a.longAccount) : NaN;
+      const sa = a ? parseFloat(a.shortAccount) : NaN;
+      S.ratio.set(sym, { ud: (la > 0 && sa > 0) ? la/sa : NaN, at: Date.now() });
+    }catch(e){
+      S.ratio.set(sym, { ud: NaN, at: Date.now() });   // 该合约没有这个数据，显示「—」
+    }
+  }
 }
 
 /* ---------- 计算 ---------- */
@@ -385,7 +467,7 @@ function compute(){
     const r = S.tick.get(name);
     if(!r || !r.p) continue;
     const m = S.meta.get(name) || {};
-    if(m.delist || (m.status && m.status !== "trading")) continue;
+    if(m.delist || (m.status && m.status !== "TRADING")) continue;
     const i = S.idx.get(name);
     let wChg = NaN, oiChg = NaN;
     if(base && base.p[i] > 0){
@@ -395,10 +477,12 @@ function compute(){
         if(base.s[i] > 0) oiChg = (r.size - base.s[i]) / base.s[i];
       }
     }
-    const oiNotional = r.size * r.mult * r.p;
+    /* 币安的持仓量单位是「币」，不是「张」，所以名义本金 = 持仓量 x 现价 */
+    const oiNotional = r.size > 0 ? r.size * r.p : NaN;
     const amp = (r.hi > 0 && r.lo > 0) ? (r.hi - r.lo)/r.lo : NaN;
     const pos24 = (r.hi > r.lo) ? (r.p - r.lo)/(r.hi - r.lo) : 0.5;
-    const ud = (m.longU > 0 && m.shortU > 0) ? m.longU / m.shortU : NaN;
+    const rc = S.ratio.get(name);
+    const ud = (rc && isFinite(rc.ud)) ? rc.ud : NaN;
     // 窗口涨跌缺失时，用启动时预热的 1 分钟 K 线补（只覆盖自选合约）
     let wSrc = isFinite(wChg) ? "ring" : "";
     if(!isFinite(wChg)){
@@ -412,9 +496,11 @@ function compute(){
     }
     out.push({ name, p:r.p, chg24:r.chg24, wChg, oiChg, oiNotional,
                vq:r.vq, hi:r.hi, lo:r.lo, amp, pos24, fund:r.fund, wSrc,
-               interval:m.interval||28800, next:m.next||0, ud, levMax:m.levMax||0 });
+               interval:m.interval||28800, next:r.next||0, ud });
   }
   S.rows = out;
+  /* 持仓量的轮转池：按 24h 成交额取前 150 个 */
+  S.oiPool = out.slice().sort((a,b)=>b.vq-a.vq).slice(0, OI_POOLMAX).map(x=>x.name);
   const moves = out.filter(x => x.vq >= S.minQuote);
   let hit = 0;
   for(const x of moves) if(isFinite(x.wChg) && Math.abs(x.wChg) >= S.alertPct/100) hit++;
@@ -454,7 +540,7 @@ function renderAlt(rows){
   let html = `<table><thead><tr>` + ALT_HEAD.map(x=>`<th>${x}</th>`).join("") + `</tr></thead><tbody>`;
   for(const x of rows){
     html += `<tr>`
-      + `<td><span class="sym">${esc(x.name.replace("_USDT",""))}<small>${esc(x.name)}</small></span></td>`
+      + `<td><span class="sym">${esc(baseOf(x.name))}<small>${esc(x.name)}</small></span></td>`
       + `<td class="num">${fmtP(x.p)}</td>`
       + `<td class="num ${cls(x.chg24)}">${pct(x.chg24)}</td>`
       + `<td class="num" style="color:#8b98a8">${fmtU(x.vq)}</td>`
@@ -478,8 +564,17 @@ function renderMove(){
   const h = (HEAD[S.board] || HEAD.up).map(t => t === "窗口涨跌" ? `${S.win/60} 分钟涨跌` : t);
   if(!rows.length){
     const snaps = S.ring.filter(x=>x.t).length;
+    const span  = (S.lastTickAt - oldestT()) / 1000;      // 已覆盖多长时间
+    /* 必须严格攒够整个窗口：快照要早于「现在 - 窗口」，才算得出这段时间的变化 */
+    const ready = span >= S.win;
+    /* 说清楚到底「窗口没攒够」还是「真的没有」——两种情况不能混成一句话 */
+    let msg;
+    if(snaps < 2) msg = "正在采集行情快照…<br>约 15 秒后可出第一个榜单";
+    else if(!ready) msg = `「${S.win/60} 分钟」窗口还在累积<br>`
+      + `已覆盖 ${Math.max(0, Math.min(100, span / S.win * 100)).toFixed(0)}%，还需 ${fmtDur(S.win - span)}`;
+    else msg = "当前没有满足成交额门槛的合约";
     $("#moveBody").innerHTML = `<div class="empty">
-      ${snaps < 2 ? "正在采集行情快照…<br>约 15 秒后可出第一个榜单" : "当前没有满足成交额门槛的合约"}<br>
+      ${msg}<br>
       <span style="color:#415065">门槛：24h 成交额 ≥ ${fmtU(S.minQuote)} U · 已采样 ${snaps} 次</span></div>`;
     return;
   }
@@ -487,11 +582,11 @@ function renderMove(){
   for(const x of rows){
     const isHit = Math.abs(x.wChg) >= S.alertPct/100;
     html += `<tr class="${isHit?"hit":""}">`;
-    html += `<td><span class="sym">${esc(x.name.replace("_USDT",""))}<small>${esc(x.name)}</small></span></td>`;
+    html += `<td><span class="sym">${esc(baseOf(x.name))}<small>${esc(x.name)}</small></span></td>`;
     html += `<td class="num">${fmtP(x.p)}</td>`;
     const fundTxt = pct(x.fund, 4) + (x.fund>0?'<span class="tag hot">多付空</span>':(x.fund<0?'<span class="tag cold">空付多</span>':""));
     const nextTxt = x.next ? (()=>{
-      const s = Math.max(0, x.next*1000 - Date.now());
+      const s = Math.max(0, x.next - Date.now());     // 币安给的就是毫秒时间戳
       const hh = Math.floor(s/3600000), mm = Math.floor(s%3600000/60000);
       return `${hh}h${String(mm).padStart(2,"0")}m`;
     })() : "—";
@@ -545,8 +640,8 @@ function renderWatch(){
     const udTxt = isFinite(ud) ? ud.toFixed(2) + (ud>1?" 多":" 空") : "—";
     html += `<div class="card" style="${hit?"border-color:#5a2a33":""}">
       <div class="top">
-        <span class="sym">${esc(x.name.replace("_USDT",""))}</span>
-        <span class="tag">${x.levMax?x.levMax+"x":"—"}</span>
+        <span class="sym">${esc(baseOf(x.name))}</span>
+        <span class="tag">U 本位</span>
         <span class="px ${cls(x.chg24)}">${fmtP(x.p)}</span>
       </div>
       <div class="grid">
@@ -556,7 +651,7 @@ function renderWatch(){
         <div class="kv"><i>年化</i><b class="${cls(x.fund)}">${pct(ann(x.fund,x.interval),1)}</b></div>
         <div class="kv"><i>持仓名义</i><b>${fmtU(x.oiNotional)}</b></div>
         <div class="kv"><i>持仓变化</i><b class="${cls(x.oiChg)}">${pct(x.oiChg)}</b></div>
-        <div class="kv"><i>多空人数比</i><b class="${cls(isFinite(ud)?ud-1:0)}">${udTxt}</b></div>
+        <div class="kv"><i>多空账户比</i><b class="${cls(isFinite(ud)?ud-1:0)}">${udTxt}</b></div>
         <div class="kv"><i>24h 成交额</i><b>${fmtU(x.vq)}</b></div>
       </div>
       <div class="rng"><div class="fill" style="width:${(x.pos24*100).toFixed(1)}%"></div>
@@ -581,7 +676,7 @@ function checkAlerts(){
     const last = S.fired.get(x.name) || 0;
     if(now - last < 5*60000) continue;
     S.fired.set(x.name, now);
-    const base = x.name.replace("_USDT","");
+    const base = baseOf(x.name);
     toast(`${base}：${reasons.join(" · ")}`);
     beep(2);
   }
@@ -589,7 +684,7 @@ function checkAlerts(){
 
 /* ---------- 渲染总控 ---------- */
 function render(){
-  /* MA99 面板自己按 60 秒轮询刷新，不跟着 Gate 的 5 秒 tick 重绘 */
+  /* MA99 面板自己按 60 秒轮询刷新，不跟着 5 秒行情 tick 重绘 */
   if($("#viewMa99").style.display === "none"){
     if($("#viewWatch").style.display === "none") renderMove();
     else renderWatch();
@@ -649,12 +744,19 @@ function fillDatalist(){
   const names = [...S.idx.keys()].sort();
   $("#symList").innerHTML = names.map(n=>`<option value="${esc(n)}">`).join("");
 }
+/* 输入宽容一点：BTC / btcusdt / BTC_USDT 都能认 */
+function normSym(raw){
+  let n = String(raw || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if(!n) return "";
+  if(!n.endsWith("USDT")) n += "USDT";
+  return n;
+}
 function addPin(raw){
-  if(!raw) return;
-  let n = raw.trim().toUpperCase().replace(/\s+/g,"");
-  if(!n.includes("_")) n += "_USDT";
-  if(!S.idx.has(n)){ toast("没有这个合约：" + n); return; }
-  if(!S.pins.includes(n)){ S.pins.push(n); save("radar.pins", S.pins); toast("已盯住 " + n.replace("_USDT","")); }
+  const n = normSym(raw);
+  if(!n) return;
+  if(!S.valid.has(n)){ toast("没有这个合约：" + n); return; }
+  if(!S.pins.includes(n)){ S.pins.push(n); save("radar.pins", S.pins); toast("已盯住 " + baseOf(n)); }
+  pollRatio().then(()=>{ compute(); renderWatch(); });
   primePin(n).then(()=>{ compute(); renderWatch(); });
   compute(); renderWatch();
 }
@@ -675,7 +777,6 @@ $("#btnAlert").onclick = () => {
 
 
 /* ---------- MA99 回踩（币安 U 本位日线） ---------- */
-const BIN    = "https://fapi.binance.com";
 const MA_KEY = "opp.ma99.v1";
 const MA_TTL = 12 * 3600 * 1000;          // 12 小时内复用缓存，不重复扫
 const M = {
@@ -686,21 +787,12 @@ const M = {
   rows: [],
 };
 
-/* 一次拉全市场 24h 行情：现价 + 成交额，用来把「距 MA99」换算成实时值 */
-async function maPollLive(){
-  try{
-    const arr = await fetchJSON(BIN + "/fapi/v1/ticker/24hr");
-    const m = new Map();
-    for(const t of arr){
-      m.set(t.symbol, {
-        p  : parseFloat(t.lastPrice) || 0,
-        vq : parseFloat(t.quoteVolume) || 0,
-      });
-    }
-    M.live = m; M.liveAt = Date.now();
-    maCompute();
-    if(S.tab === "ma99") maRender();
-  }catch(e){ /* 轮询失败静默，下一分钟再来 */ }
+/* 现价直接用主轮询那份（同一批 ticker/24hr 数据），不再单独打一次请求 */
+function syncMa99Live(){
+  const m = new Map();
+  for(const [sym, r] of S.tick) if(r.p > 0) m.set(sym, { p: r.p, vq: r.vq });
+  M.live = m; M.liveAt = S.lastTickAt || Date.now();
+  maCompute();
 }
 
 function maCompute(){
@@ -908,8 +1000,8 @@ if(M.data){
   maHint(age > MA_TTL / 60000 ? `缓存 ${Math.round(age / 60)} 小时，建议重扫` : `缓存 ${age} 分钟前`,
          age > MA_TTL / 60000);
 }
-maPollLive();
-setInterval(maPollLive, 60000);
+syncMa99Live();
+setInterval(()=>{ maCompute(); if(S.tab === "ma99") maRender(); }, 60000);
 
 /* ---------- 启动 ---------- */
 /* 对外只留一个参数：?tab=move|watch|ma99，方便把某个标签页存成书签 */
@@ -921,13 +1013,16 @@ setInterval(maPollLive, 60000);
 $("#btnSound").classList.toggle("on", S.sound);
 $("#minQuoteLab").textContent = fmtU(S.minQuote) + " U";
 $("#minQuote").value = QUOTE_STEPS.indexOf(1e6);
-loadMeta();
-tick().then(()=>{
-  compute(); primeAll();
-  setTimeout(()=>{ compute(); render(); }, 6000);
+/* 启动顺序要紧：必须先拿到合约清单，否则过滤不出该看哪些符号 */
+loadMeta().then(n => {
+  if(!n){ paintStatus("合约清单为空"); return; }
+  return tick().then(()=>{
+    compute(); primeAll(); pollRatio();
+    setTimeout(()=>{ compute(); render(); }, 6000);
+  });
 });
 setInterval(tick, POLL_MS);
-setInterval(()=>{ if(!S.paused){ primeAll(); compute(); render(); } }, 30000); // 倒计时 / 预热缓存兜底刷新
+setInterval(()=>{ if(!S.paused){ primeAll(); pollRatio(); compute(); render(); } }, 30000); // 倒计时 / 预热缓存兜底刷新
 </script>
 </body>
 </html>

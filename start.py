@@ -24,7 +24,7 @@ import webbrowser
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-CSP = ("connect-src https://api.gateio.ws https://fapi.binance.com; "
+CSP = ("connect-src https://fapi.binance.com; "
        "img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
        "object-src 'none'; base-uri 'none'; form-action 'none'")
 
