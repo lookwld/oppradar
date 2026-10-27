@@ -7,7 +7,7 @@
   2. 端口默认由操作系统随机分配（监听 0 号端口，内核回填真实端口），
      所以端口号不确定、不写死、每次可能不同，难以被扫描定位；
   3. 关闭目录浏览，只对外提供本目录下的静态文件；
-  4. 附加安全响应头（CSP 白名单只放两家交易所行情接口、禁用 Referer、禁止嗅探）。
+  4. 附加安全响应头（CSP 白名单只放币安行情接口、禁用 Referer、禁止嗅探）。
 
 用法：
     python start.py               # 随机端口 + 自动打开浏览器
@@ -33,11 +33,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     """静态文件处理器：加响应头、关目录列表、不写访问日志。"""
 
     def __init__(self, *a, **kw):
-        try:                                  # Python 3.7+ 支持 directory 形参
-            super().__init__(*a, directory=ROOT, **kw)
-        except TypeError:
-            os.chdir(ROOT)
-            super().__init__(*a, **kw)
+        super().__init__(*a, directory=ROOT, **kw)
 
     def end_headers(self):
         self.send_header("Content-Security-Policy", CSP)

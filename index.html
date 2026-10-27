@@ -96,7 +96,6 @@
     <span class="dot off" id="dot"></span>
     <span class="meta" id="meta">连接中…</span>
     <span class="spacer"></span>
-    <button class="iconbtn" id="btnSound">声音</button>
     <button class="iconbtn" id="btnPause">暂停</button>
   </div>
   <div class="tabs">
@@ -124,7 +123,7 @@
     </div>
     <div class="slider">
       <span>24h 成交额 ≥</span>
-      <input type="range" id="minQuote" min="0" max="8" step="1" value="6">
+      <input type="range" id="minQuote" min="0" max="8" step="1" value="3">
       <span id="minQuoteLab" style="min-width:54px;text-align:right">100万 U</span>
     </div>
     <div id="moveBody"></div>
@@ -196,8 +195,7 @@ const OI_BATCH   = 50;               // 每 5 秒取 50 个，约 15 秒轮完�
 /* ---------- 状态 ---------- */
 const S = {
   tick: new Map(),        // 合约 -> {p, chg24, hi, lo, vq, size, fund, next, mark}
-  meta: new Map(),        // 合约 -> {interval, status, base}
-  valid: new Set(),       // 可交易的 USDT 永续合约名
+  meta: new Map(),        // 合约 -> { interval }  结算周期（秒）；有键即代表是可交易的 USDT 永续
   ratio: new Map(),       // 合约 -> {ud, at}  多空账户比
   oiPool: [], oiCur: 0,   // 持仓量轮转游标
   syms: [], idx: new Map(),
@@ -208,13 +206,10 @@ const S = {
     let s = String(n).toUpperCase().replace(/[^A-Z0-9]/g, "");
     return s.endsWith("USDT") ? s : s + "USDT";     // 老版本存的是 BTC_USDT，顺手迁移
   }),
-  sound: load("radar.sound", true),
   alertPct: load("radar.alertPct", 1.5),
   alertFund: load("radar.alertFund", 0.001),
   paused: false,
   fired: new Map(),       // 预警去重
-  hist: new Map(),        // 自选合约的 1 分钟 K 线缓存（启动时预热，免等 15 分钟）
-  histTs: new Map(),      // 上面缓存的抓取时刻，超过 2 分钟就重拉
   rows: [],               // 最近一次计算结果
 };
 
@@ -253,22 +248,6 @@ const hhmmss = ts => {
 function toast(msg){
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
   clearTimeout(toast._h); toast._h = setTimeout(()=>t.classList.remove("show"), 2200);
-}
-let ac = null;
-function beep(times){
-  if(!S.sound) return;
-  try{
-    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
-    for(let i=0;i<(times||1);i++){
-      const o = ac.createOscillator(), g = ac.createGain();
-      o.type = "sine"; o.frequency.value = 880;
-      const t0 = ac.currentTime + i*0.18;
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.12, t0+0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0+0.12);
-      o.connect(g); g.connect(ac.destination); o.start(t0); o.stop(t0+0.14);
-    }
-  }catch(e){}
 }
 
 /* ---------- 环形缓冲 ---------- */
@@ -320,45 +299,17 @@ async function loadMeta(){
     for(const c of (info.symbols || [])){
       /* 只要 USDT 计价的永续、且正在交易；币安还有 USDC 计价和交割合约，全部挡掉 */
       if(c.contractType !== "PERPETUAL" || c.status !== "TRADING" || c.quoteAsset !== "USDT") continue;
-      S.valid.add(c.symbol);
-      S.meta.set(c.symbol, {
-        interval: fiMap.get(c.symbol) || 28800,
-        next: 0,
-        status: c.status,
-        base: c.baseAsset || "",
-        delist: false,
-      });
+      S.meta.set(c.symbol, { interval: fiMap.get(c.symbol) || 28800 });
     }
     /* 索引在这里一次性定死，避免运行中新合约陆续到达把环形缓冲撑爆重来 */
-    S.syms = [...S.valid].sort();
+    S.syms = [...S.meta.keys()].sort();
     S.idx = new Map(S.syms.map((n, i) => [n, i]));
     fillDatalist();
-    return S.valid.size;
+    return S.meta.size;
   }catch(e){
     console.warn("exchangeInfo 拉取失败", e);
     return 0;
   }
-}
-/* 自选合约预热：拉 1 分钟 K 线，免等窗口累积 */
-async function primePin(name){
-  if(S.idx.get(name) === undefined) return;
-  if(S.hist.has(name) && Date.now() - (S.histTs.get(name)||0) < 120000) return;
-  try{
-    const url = BIN + "/fapi/v1/klines?symbol=" + encodeURIComponent(name)
-              + "&interval=1m&limit=200";
-    const arr = await fetchJSON(url);
-    const pts = [];
-    for(const k of arr){
-      const c = parseFloat(k[4]);          // [4] = 收盘价
-      const t = parseInt(k[6], 10);        // [6] = 收盘时刻（毫秒）
-      if(c > 0) pts.push({ t, p:c });
-    }
-    pts.sort((a,b)=>a.t-b.t);
-    if(pts.length){ S.hist.set(name, pts); S.histTs.set(name, Date.now()); }
-  }catch(e){ console.warn("预热失败", name, e); }
-}
-function primeAll(){
-  for(const n of S.pins) primePin(n);
 }
 function oldestT(){
   let m = Infinity;
@@ -404,7 +355,7 @@ async function tick(){
     const now = Date.now();
     for(const t of arrT){
       const name = t.symbol;
-      if(!S.valid.has(name)) continue;          // 挡掉 USDC 计价 / 交割合约
+      if(!S.meta.has(name)) continue;           // 挡掉 USDC 计价 / 交割合约
       let i = S.idx.get(name);
       if(i === undefined){ i = S.syms.length; S.idx.set(name, i); S.syms.push(name); }
       const last = parseFloat(t.lastPrice) || 0;
@@ -466,8 +417,6 @@ function compute(){
   for(const name of S.syms){
     const r = S.tick.get(name);
     if(!r || !r.p) continue;
-    const m = S.meta.get(name) || {};
-    if(m.delist || (m.status && m.status !== "TRADING")) continue;
     const i = S.idx.get(name);
     let wChg = NaN, oiChg = NaN;
     if(base && base.p[i] > 0){
@@ -483,20 +432,10 @@ function compute(){
     const pos24 = (r.hi > r.lo) ? (r.p - r.lo)/(r.hi - r.lo) : 0.5;
     const rc = S.ratio.get(name);
     const ud = (rc && isFinite(rc.ud)) ? rc.ud : NaN;
-    // 窗口涨跌缺失时，用启动时预热的 1 分钟 K 线补（只覆盖自选合约）
-    let wSrc = isFinite(wChg) ? "ring" : "";
-    if(!isFinite(wChg)){
-      const h = S.hist.get(name);
-      if(h && h.length){
-        const target = S.lastTickAt - S.win*1000;
-        let b = null;
-        for(const x of h){ if(x.t <= target) b = x; else break; }
-        if(b && b.p > 0 && (target - b.t) <= 120000){ wChg = (r.p - b.p)/b.p; wSrc = "kline"; }
-      }
-    }
+    const mi = S.meta.get(name);
     out.push({ name, p:r.p, chg24:r.chg24, wChg, oiChg, oiNotional,
-               vq:r.vq, hi:r.hi, lo:r.lo, amp, pos24, fund:r.fund, wSrc,
-               interval:m.interval||28800, next:r.next||0, ud });
+               vq:r.vq, hi:r.hi, lo:r.lo, amp, pos24, fund:r.fund,
+               interval:(mi && mi.interval) || 28800, next:r.next || 0, ud });
   }
   S.rows = out;
   /* 持仓量的轮转池：按 24h 成交额取前 150 个 */
@@ -535,32 +474,8 @@ function ann(fund, interval){
   if(!isFinite(fund) || !interval) return NaN;
   return fund * (86400*365/interval);
 }
-const ALT_HEAD = ["合约","现价","24h 涨跌","24h 成交额","24h 振幅","持仓名义"];
-function renderAlt(rows){
-  let html = `<table><thead><tr>` + ALT_HEAD.map(x=>`<th>${x}</th>`).join("") + `</tr></thead><tbody>`;
-  for(const x of rows){
-    html += `<tr>`
-      + `<td><span class="sym">${esc(baseOf(x.name))}<small>${esc(x.name)}</small></span></td>`
-      + `<td class="num">${fmtP(x.p)}</td>`
-      + `<td class="num ${cls(x.chg24)}">${pct(x.chg24)}</td>`
-      + `<td class="num" style="color:#8b98a8">${fmtU(x.vq)}</td>`
-      + `<td class="num">${pct(x.amp,1)}</td>`
-      + `<td class="num" style="color:#8b98a8">${fmtU(x.oiNotional)}</td>`
-      + `</tr>`;
-  }
-  return html + "</tbody></table>"
-    + `<div class="foot" style="padding:12px 4px 0">`
-    + `窗口采集中 ${Math.min(100, (S.lastTickAt - oldestT())/1000 / S.win * 100).toFixed(0)}%`
-    + ` · 还需 ${fmtDur(S.win - (S.lastTickAt - oldestT())/1000)} 切到 ${S.win/60} 分钟榜<br>`
-    + `期间按 24 小时涨跌排序（数据真实，只是口径不同）</div>`;
-}
 function renderMove(){
   const rows = boardRows();
-  const allFb = rows.length > 0 && rows.every(x => !isFinite(x.wChg));
-  if(allFb && (S.board === "up" || S.board === "down")){
-    $("#moveBody").innerHTML = renderAlt(rows);
-    return;
-  }
   const h = (HEAD[S.board] || HEAD.up).map(t => t === "窗口涨跌" ? `${S.win/60} 分钟涨跌` : t);
   if(!rows.length){
     const snaps = S.ring.filter(x=>x.t).length;
@@ -678,13 +593,12 @@ function checkAlerts(){
     S.fired.set(x.name, now);
     const base = baseOf(x.name);
     toast(`${base}：${reasons.join(" · ")}`);
-    beep(2);
   }
 }
 
 /* ---------- 渲染总控 ---------- */
 function render(){
-  /* MA99 面板自己按 60 秒轮询刷新，不跟着 5 秒行情 tick 重绘 */
+  /* MA99 面板由 syncMa99Live() 单独刷新，这里只画另外两屏 */
   if($("#viewMa99").style.display === "none"){
     if($("#viewWatch").style.display === "none") renderMove();
     else renderWatch();
@@ -729,11 +643,6 @@ $("#minQuote").oninput = e => {
   $("#minQuoteLab").textContent = fmtU(S.minQuote) + " U";
   compute(); renderMove();
 };
-$("#btnSound").onclick = e => {
-  S.sound = !S.sound; save("radar.sound", S.sound);
-  e.target.classList.toggle("on", S.sound);
-  if(S.sound) beep(1);
-};
 $("#btnPause").onclick = e => {
   S.paused = !S.paused;
   e.target.textContent = S.paused ? "继续" : "暂停";
@@ -754,10 +663,9 @@ function normSym(raw){
 function addPin(raw){
   const n = normSym(raw);
   if(!n) return;
-  if(!S.valid.has(n)){ toast("没有这个合约：" + n); return; }
+  if(!S.meta.has(n)){ toast("没有这个合约：" + n); return; }
   if(!S.pins.includes(n)){ S.pins.push(n); save("radar.pins", S.pins); toast("已盯住 " + baseOf(n)); }
   pollRatio().then(()=>{ compute(); renderWatch(); });
-  primePin(n).then(()=>{ compute(); renderWatch(); });
   compute(); renderWatch();
 }
 $("#btnAdd").onclick = () => { addPin($("#addInput").value); $("#addInput").value = ""; };
@@ -793,6 +701,7 @@ function syncMa99Live(){
   for(const [sym, r] of S.tick) if(r.p > 0) m.set(sym, { p: r.p, vq: r.vq });
   M.live = m; M.liveAt = S.lastTickAt || Date.now();
   maCompute();
+  if(S.tab === "ma99") maRender();     // 该页不参与 render() 的 5 秒重绘，现价走这里更新
 }
 
 function maCompute(){
@@ -990,18 +899,15 @@ $("#maMinQuote").oninput = e => {
   if(S.tab === "ma99") maRender();
 };
 
-/* 启动：先读缓存，再拉一次实时价；缓存过期只提示，不自动扫 */
+/* 启动：先读缓存；缓存过期只提示，不自动扫 */
 M.data = load(MA_KEY, null);
 M.minq = QUOTE_STEPS[parseInt($("#maMinQuote").value, 10)] || 0;
 $("#maMinQuoteLab").textContent = fmtU(M.minq) + " U";
-maCompute();
 if(M.data){
   const age = Math.round((Date.now() - M.data.ts) / 60000);
   maHint(age > MA_TTL / 60000 ? `缓存 ${Math.round(age / 60)} 小时，建议重扫` : `缓存 ${age} 分钟前`,
          age > MA_TTL / 60000);
 }
-syncMa99Live();
-setInterval(()=>{ maCompute(); if(S.tab === "ma99") maRender(); }, 60000);
 
 /* ---------- 启动 ---------- */
 /* 对外只留一个参数：?tab=move|watch|ma99，方便把某个标签页存成书签 */
@@ -1010,19 +916,15 @@ setInterval(()=>{ maCompute(); if(S.tab === "ma99") maRender(); }, 60000);
   const el = t && document.querySelector(`.tab[data-tab="${t}"]`);
   if(el) el.click();
 }
-$("#btnSound").classList.toggle("on", S.sound);
 $("#minQuoteLab").textContent = fmtU(S.minQuote) + " U";
 $("#minQuote").value = QUOTE_STEPS.indexOf(1e6);
 /* 启动顺序要紧：必须先拿到合约清单，否则过滤不出该看哪些符号 */
 loadMeta().then(n => {
   if(!n){ paintStatus("合约清单为空"); return; }
-  return tick().then(()=>{
-    compute(); primeAll(); pollRatio();
-    setTimeout(()=>{ compute(); render(); }, 6000);
-  });
+  return tick().then(()=>{ compute(); pollRatio(); });
 });
 setInterval(tick, POLL_MS);
-setInterval(()=>{ if(!S.paused){ primeAll(); pollRatio(); compute(); render(); } }, 30000); // 倒计时 / 预热缓存兜底刷新
+setInterval(()=>{ if(!S.paused){ pollRatio(); compute(); render(); } }, 30000); // 多空比与倒计时兜底刷新
 </script>
 </body>
 </html>
